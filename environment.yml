@@ -1,0 +1,40 @@
+name: tem
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.3.1
+  - torchvision=0.18.1
+  - torchaudio=2.3.1
+  - pytorch-cuda=12.1
+    - numpy
+  - scipy
+  - scikit-learn
+  - pandas
+    - matplotlib
+  - seaborn
+  - plotly
+  - h5py
+  - lovely-tensors
+  - jupyterlab
+  - ipykernel
+  - ipywidgets
+  - pytest
+  - black
+  - flake8
+  - mypy
+  - networkx
+  - tqdm
+  - pyyaml
+  - python-dotenv
+  - rich
+  - einops
+  - tensorboard
+  - wandb
+  - pip
+  - pip:
+    - torchinfo
+    - pytorch-lightning>=2.2
