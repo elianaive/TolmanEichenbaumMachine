@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 
 
 def safe_histogram(data, name="data"):
-    """Creates a wandb.Histogram while handling potential edge cases like collapsed variance."""
     if data is None or len(data) == 0:
         logger.warning(f"Empty data for histogram '{name}'. Skipping.")
         return None
@@ -155,10 +154,7 @@ class TEMTrainer:
             dtype=torch.bool, device=self.device
         )
         
-        active_datasets = [
-            TrajectoryDataset(env.generate_trajectory(2000), self.config.n_sensory_objects, self.device)
-            for env in self.train_envs
-        ]
+        active_datasets = None
         
         persistent_state = self.model.create_empty_memory(self.args.batch_size, self.device)
         trajectory_positions = [0] * self.args.batch_size
