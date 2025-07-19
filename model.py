@@ -335,18 +335,18 @@ class CompleteLoss(nn.Module):
         # This term aligns the inference model's posteriors with the generative model's priors.
 
         # g-space alignment: D_KL(q(g_t|...) || p(g_t|g_{t-1}, a_t))
-        g_kl = [
-            self._gaussian_kl(
-                g_inf.mean, g_inf.log_var, g_pr.mean, g_pr.log_var
-            )
-            for g_inf, g_pr in zip(reps["g_inf"], reps["g_prior"])
-        ]
-        losses["g_kl"] = torch.stack(g_kl, dim=0).sum(0)
-        # g_align_mse = [
-        #     0.5 * (g_inf.sample - g_pr.mean).pow(2).sum(-1)
+        # g_kl = [
+        #     self._gaussian_kl(
+        #         g_inf.mean, g_inf.log_var, g_pr.mean, g_pr.log_var
+        #     )
         #     for g_inf, g_pr in zip(reps["g_inf"], reps["g_prior"])
         # ]
-        # losses["g_kl"] = torch.stack(g_align_mse, dim=0).sum(0)
+        # losses["g_kl"] = torch.stack(g_kl, dim=0).sum(0)
+        g_align_mse = [
+            0.5 * (g_inf.sample - g_pr.mean).pow(2).sum(-1)
+            for g_inf, g_pr in zip(reps["g_inf"], reps["g_prior"])
+        ]
+        losses["g_kl"] = torch.stack(g_align_mse, dim=0).sum(0)
 
         # p-space alignment: D_KL(q(p_t|...) || p(p_t|g_t, M_{t-1}))
         p_align_mse = [
@@ -895,7 +895,8 @@ class TolmanEichenbaumMachine(nn.Module):
                 'x_gt': F.softmax(x_logits_gt, dim=-1),
             },
             'new_state': new_state,
-            'diagnostics': diagnostics
+            'diagnostics': diagnostics,
+            'reps_dict': reps_dict
         }
 
     def create_empty_memory(self, batch_size, device: torch.device) -> Dict[str, Any]:
