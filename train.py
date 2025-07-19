@@ -141,8 +141,19 @@ class TEMTrainer:
         logger.info(f"Starting Training for {self.args.train_it} iterations.")
         
         # --- Initialization ---
-        self.train_envs = train_envs # FIX: Assign train_envs to the instance
+        self.train_envs = train_envs
         assert len(self.train_envs) == self.args.batch_size, "Number of training environments must equal batch size."
+        
+        # Determine max number of nodes for the visited tensor
+        max_n_nodes = 0
+        if self.train_envs:
+            max_n_nodes = max(env.n_nodes for env in self.train_envs)
+        
+        # Initialize visited state tracking for each environment in the batch
+        self.visited = torch.zeros(
+            self.args.batch_size, max_n_nodes,
+            dtype=torch.bool, device=self.device
+        )
         
         active_datasets = [
             TrajectoryDataset(env.generate_trajectory(2000), self.config.n_sensory_objects, self.device)
@@ -173,7 +184,7 @@ class TEMTrainer:
             self.model.memory_system.hebbian_forget_rate.fill_(lambda_eff)
             
             # 2. Prepare batch of trajectory segments
-            x_bptt, a_bptt, persistent_state, active_datasets, trajectory_positions = self._prepare_batch_data(
+            x_bptt, a_bptt, node_bptt, persistent_state, active_datasets, trajectory_positions = self._prepare_batch_data(
                 active_datasets, trajectory_positions, persistent_state, i
             )
             
@@ -182,37 +193,49 @@ class TEMTrainer:
             torch.compiler.cudagraph_mark_step_begin()
             bptt_state = self._detach_state(persistent_state)
             
+            is_revisit_mask = self._compute_visit_mask(node_bptt).float()
+            
             total_loss = 0.0
             all_losses_for_log = defaultdict(float) 
             diagnostics_for_log = defaultdict(list)
+            total_active_samples = 0.0
 
             with autocast(enabled=self.scaler.is_enabled()):
                 for t in range(self.args.bptt_len - 1):
                     outputs = self.model(x_bptt[t], a_bptt[t], bptt_state)
-                    total_loss += outputs['losses']['total_loss'].mean()
+                    per_sample_loss = outputs['losses']['total_loss']
                     bptt_state = outputs['new_state']
+
+                    mask_t = is_revisit_mask[t]
+                    num_active_samples_t = mask_t.sum()
+
+                    if num_active_samples_t > 0:
+                        timestep_loss = (per_sample_loss * mask_t).sum() / num_active_samples_t
+                        total_loss += timestep_loss
+                        total_active_samples += 1
                     
                     for k, v in outputs['losses'].items():
                         all_losses_for_log[f"train_loss/{k}"] += v.mean().item()
-
                     if self.args.log_debug_metrics and 'diagnostics' in outputs:
                         for k, v in outputs['diagnostics'].items():
                             diagnostics_for_log[k].append(v)
             
-            avg_loss = total_loss / (self.args.bptt_len - 1)
-            
-            if torch.isfinite(avg_loss):
-                self.scaler.scale(avg_loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+            avg_loss = torch.tensor(0.0)
+            grad_norm = torch.tensor(0.0)
+            if total_active_samples > 0:
+                avg_loss = total_loss / total_active_samples
+                if torch.isfinite(avg_loss):
+                    self.scaler.scale(avg_loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
 
             persistent_state = self._detach_state(bptt_state)
             
             # 4. Logging and Checkpointing
             if (i + 1) % self.args.log_interval == 0:
-                val_loss, val_acc = self.run_validation(val_envs[0:2])
+                val_loss, val_acc = self.run_validation(val_envs)
                 avg_diagnostics = {
                     k: np.mean([t for t in v]) 
                     for k, v in diagnostics_for_log.items()
@@ -221,13 +244,11 @@ class TEMTrainer:
                 hist_data = {}
                 if self.args.log_debug_metrics:
                     with torch.no_grad():
-                        g_inf_list = bptt_state.get('g_states', [])
                         p_inf_list = bptt_state.get('p_inf', [])
                         
-                        last_g_inf_list = outputs.get('new_state', {}).get('g_states', [])
                         if isinstance(outputs['new_state']['g_states'][0], torch.Tensor):
-                             last_g_inf_list_full = outputs.get('reps_dict', {}).get('g_inf', [])
-                             if last_g_inf_list_full:
+                            last_g_inf_list_full = outputs.get('reps_dict', {}).get('g_inf', [])
+                            if last_g_inf_list_full:
                                 g_vars_list = [g.log_var.exp() for g in last_g_inf_list_full]
                                 g_var_data = torch.cat(g_vars_list, dim=-1).flatten().cpu().numpy()
                                 hist_data['hist/g_var'] = g_var_data
@@ -252,11 +273,13 @@ class TEMTrainer:
         """Prepares a BPTT segment, resetting environments and states as needed."""
         x_bptt = torch.empty(self.args.bptt_len, self.args.batch_size, self.config.n_sensory_objects, device=self.device)
         a_bptt = torch.empty(self.args.bptt_len, self.args.batch_size, device=self.device, dtype=torch.long)
+        node_bptt = torch.empty(self.args.bptt_len, self.args.batch_size, device=self.device, dtype=torch.long)
         
         for b in range(self.args.batch_size):
             start_idx, end_idx = trajectory_positions[b], trajectory_positions[b] + self.args.bptt_len
             if end_idx >= len(active_datasets[b]):
-                env = self.train_envs[b] # Uses self.train_envs
+                self.visited[b].zero_()
+                env = self.train_envs[b]
                 env.reset_sensory_map()
                 traj_len = self._get_curriculum_trajectory_length(env, step)
                 active_datasets[b] = TrajectoryDataset(env.generate_trajectory(traj_len), self.config.n_sensory_objects, self.device)
@@ -277,8 +300,9 @@ class TEMTrainer:
             ds = active_datasets[b]
             x_bptt[:, b].copy_(ds.one_hot_observations[start_idx:end_idx])
             a_bptt[:, b].copy_(ds.actions[start_idx:end_idx])
+            node_bptt[:, b].copy_(ds.nodes[start_idx:end_idx])
             trajectory_positions[b] = end_idx
-        return x_bptt, a_bptt, persistent_state, active_datasets, trajectory_positions
+        return x_bptt, a_bptt, node_bptt, persistent_state, active_datasets, trajectory_positions
 
     def _get_curriculum_trajectory_length(self, env, step):
         """Calculates trajectory length based on a curriculum that shortens trajectories over time."""
@@ -287,6 +311,26 @@ class TEMTrainer:
         jitter = np.random.randint(0, self.args.seq_jitter)
         walk_len = int((n_restart + jitter) * env.n_nodes)
         return max(self.args.bptt_len, (walk_len // self.args.bptt_len) * self.args.bptt_len)
+    
+    def _compute_visit_mask(self, node_bptt: torch.Tensor) -> torch.Tensor:
+        """
+        Computes a boolean mask indicating which timesteps are re-visits to a node.
+        Loss should only be calculated on these timesteps.
+        """
+        mask_bool = torch.empty_like(node_bptt, dtype=torch.bool)
+        
+        for t in range(node_bptt.shape[0]):
+            nodes_t = node_bptt[t] # Shape: (batch_size,)
+            
+            # For each item in the batch, check if its current node has been visited
+            # gather expects index to have same number of dims as input
+            visited_t = self.visited.gather(1, nodes_t.unsqueeze(1)).squeeze(1)
+            mask_bool[t] = visited_t
+            
+            # Update the visited tensor with the new nodes
+            self.visited.scatter_(1, nodes_t.unsqueeze(1), True)
+            
+        return mask_bool
 
     def _log_training_metrics(self, step, train_loss, individual_losses, diagnostics, val_loss, val_acc, grad_norm, hist_data=None):
         """Logs all training and validation metrics to Wandb in an organized way."""
@@ -308,6 +352,8 @@ class TEMTrainer:
             'curriculum/hebb_eta': hebb_eta,
             'curriculum/temp': temp,
         })
+        
+        log_data['curriculum/trajectory_length'] = self._get_curriculum_trajectory_length(self.train_envs[0], step)
 
         if self.args.log_debug_metrics:
             log_data.update(diagnostics)
@@ -467,7 +513,7 @@ def main():
 
     # --- Group: Dataset Settings ---
     data_group = parser.add_argument_group('Dataset Settings')
-    data_group.add_argument('--n_val_samples', type=int, default=20)
+    data_group.add_argument('--n_val_samples', type=int, default=3)
     data_group.add_argument('--val_trajectory_len', type=int, default=200)
     data_group.add_argument('--min_size', type=int, default=8)
     data_group.add_argument('--max_size', type=int, default=12)
@@ -505,6 +551,16 @@ def main():
         args.run_name = f"tem_{args.env_type}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     
     run = wandb.init(project=args.project_name, name=args.run_name, config=args)
+    
+    code_artifact = wandb.Artifact(
+        "source-code", type="source-code",
+        description="The source code for this run."
+    )
+    code_artifact.add_file("model.py")
+    code_artifact.add_file("train.py")
+    code_artifact.add_file("environment.py")
+    run.log_artifact(code_artifact)
+    
     np.random.seed(args.seed); torch.manual_seed(args.seed)
     
     config = TEMConfig()
@@ -529,10 +585,10 @@ def main():
             logger.info("Compiling model with 'max-autotune' mode.")
             model = torch.compile(model, mode="max-autotune")
         else:
-            logger.info("Compiling model with 'reduce-overhead' mode.")
+            logger.info("Compiling model with 'max-autotune-no-cudagraphs' mode.")
             model = torch.compile(
                 model,
-                mode="reduce-overhead",
+                mode="max-autotune-no-cudagraphs",
                 disable="cudagraphs",
                 dynamic=True,
                 fullgraph=True
