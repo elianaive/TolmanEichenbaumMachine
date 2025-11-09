@@ -47,23 +47,27 @@ def run_generalization_analysis(model, env, config, trajectory_len=10000, device
     correct_preds = {'p': 0, 'g': 0, 'gt': 0}
     total_preds = 0
     
+    node_accuracies = {node: {'p': [], 'g': [], 'gt': []} for node in range(env.n_nodes)}
+    node_visits = np.zeros(env.n_nodes)
+    
     # Track inference opportunities (visiting known node via new edge)
     inference_opportunities = 0
     correct_inferences = {'p': 0, 'g': 0, 'gt': 0}
     
     prev_state = model.create_empty_memory(1, device)
-    
+
     # Run analysis
     with torch.no_grad():
         iterator = tqdm(range(len(dataset) - 1), desc="Analyzing") if verbose else range(len(dataset) - 1)
-        
+
         for t in iterator:
             current_step, next_step = dataset[t], dataset[t+1]
-            
+
             # Get model predictions for CURRENT observation
-            outputs = model(
-                current_step['x_t'].unsqueeze(0),
-                torch.tensor([current_step['a_t']], device=device),
+            # Use forward_single_step directly for single timestep analysis
+            outputs = model.forward_single_step(
+                current_step['x_t'].unsqueeze(0),  # (1,) -> (1, n_sensory)
+                torch.tensor([current_step['a_t']], device=device),  # (1,) action
                 prev_state
             )
             prev_state = outputs['new_state']
@@ -76,6 +80,7 @@ def run_generalization_analysis(model, env, config, trajectory_len=10000, device
             # Test predictions only on previously visited nodes
             if current_step['node'] in visited_nodes:
                 true_current = current_step['x_t'].argmax().item()
+                node = current_step['node']
                 
                 # Check if this is an inference opportunity (new edge to known node)
                 is_new_edge = False
@@ -84,15 +89,21 @@ def run_generalization_analysis(model, env, config, trajectory_len=10000, device
                     if is_new_edge:
                         inference_opportunities += 1
                 
-                # Test all three prediction pathways
+                # Test all three prediction pathways and record per-node
                 for pred_type in ['p', 'g', 'gt']:
                     pred_current = outputs['predictions'][f'x_{pred_type}'].argmax(dim=-1)[0].item()
-                    if pred_current == true_current:
+                    is_correct = (pred_current == true_current)
+                    node_accuracies[node][pred_type].append(float(is_correct))
+                    
+                    if is_correct:
                         correct_preds[pred_type] += 1
                         if is_new_edge:
                             correct_inferences[pred_type] += 1
                 
                 total_preds += 1
+
+            # Track visits to all nodes
+            node_visits[current_step['node']] += 1
             
             # Update visited sets AFTER testing
             visited_nodes.add(current_step['node'])
@@ -114,10 +125,17 @@ def run_generalization_analysis(model, env, config, trajectory_len=10000, device
             
             # Record accuracies
             for pred_type in ['p', 'g', 'gt']:
+                # Calculate per-node average accuracy
+                acc_per_node = np.array([
+                    np.mean(node_accuracies[i][pred_type]) if len(node_accuracies[i][pred_type]) > 0 else 0.0
+                    for i in range(env.n_nodes)
+                ])
+                
+                # Weight by visit counts (like original TEM)
+                weighted_acc = np.sum(acc_per_node * node_visits) / np.sum(node_visits) if np.sum(node_visits) > 0 else 0.0
+                
                 acc_key = f'accuracy_{pred_type}'
-                history[acc_key].append(
-                    correct_preds[pred_type] / total_preds if total_preds > 0 else 0.0
-                )
+                history[acc_key].append(weighted_acc)
     
     # Calculate final statistics
     final_results = {
