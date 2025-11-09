@@ -104,11 +104,10 @@ class Grid2DEnvironment(BaseEnvironment):
         """
         # Calculate angle difference for each available action
         angle_diffs = []
-        for action in range(self.n_actions):
-            if self.transitions[current_node, action] != -1:
-                action_angle = self._get_action_angle(action)
-                diff = self._angle_difference(current_angle, action_angle)
-                angle_diffs.append((diff, action))
+        for action in available_actions:
+            action_angle = self._get_action_angle(action)
+            diff = self._angle_difference(current_angle, action_angle)
+            angle_diffs.append((diff, action))
         
         if not angle_diffs:
             # No valid moves (shouldn't happen in a proper grid)
@@ -212,14 +211,16 @@ class Grid2DEnvironment(BaseEnvironment):
                 action = 0
                 next_node = current_node
             elif policy_type == 'angle':
-                action, new_angle = self._get_angle_based_action(
+                action, proposed_angle = self._get_angle_based_action(
                     current_node, current_angle, valid_actions
                 )
-                
+
                 if np.random.rand() > direc_bias:
                     action = np.random.choice(valid_actions)
-                
-                current_angle = new_angle
+                    current_angle = self._get_action_angle(action)
+                else:
+                    current_angle = proposed_angle
+
             else:
                 # Other policies (random, border, object)
                 probs = self._get_policy_for_node(current_node, policy_type, policy_beta)
